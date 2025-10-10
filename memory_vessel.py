@@ -145,20 +145,27 @@ class MemoryContainmentVessel:
         record = MemoryRecord(memory_id, data, metadata, created_at)
 
         with self._lock, self._conn:
-            shard_name = self._select_shard_for_write()
-            self._conn.execute(
-                f"""
-                INSERT INTO {shard_name} (memory_id, data, metadata, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(memory_id) DO UPDATE SET
-                    data=excluded.data,
-                    metadata=excluded.metadata,
-                    created_at=excluded.created_at
-                """,
-                (memory_id, data, encoded_metadata, created_at),
-            )
-            if not self._memory_exists_elsewhere(memory_id, shard_name):
+            shard_name = self._locate_shard_for_memory(memory_id)
+            if shard_name:
+                self._conn.execute(
+                    f"""
+                    UPDATE {shard_name}
+                    SET data = ?, metadata = ?, created_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (data, encoded_metadata, created_at, memory_id),
+                )
+            else:
+                shard_name = self._select_shard_for_write()
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {shard_name} (memory_id, data, metadata, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (memory_id, data, encoded_metadata, created_at),
+                )
                 self._increment_shard_count(shard_name)
+            self._purge_duplicate_records(memory_id, shard_name)
         self.cache.put(memory_id, record)
         return record
 
@@ -276,17 +283,26 @@ class MemoryContainmentVessel:
             (shard_name,),
         )
 
-    def _memory_exists_elsewhere(self, memory_id: str, current_shard: str) -> bool:
+    def _locate_shard_for_memory(self, memory_id: str) -> Optional[str]:
         for shard_name, _ in self._load_shards():
-            if shard_name == current_shard:
-                continue
             cursor = self._conn.execute(
                 f"SELECT 1 FROM {shard_name} WHERE memory_id = ?",
                 (memory_id,),
             )
             if cursor.fetchone():
-                return True
-        return False
+                return shard_name
+        return None
+
+    def _purge_duplicate_records(self, memory_id: str, authoritative_shard: str) -> None:
+        for shard_name, _ in self._load_shards():
+            if shard_name == authoritative_shard:
+                continue
+            result = self._conn.execute(
+                f"DELETE FROM {shard_name} WHERE memory_id = ?",
+                (memory_id,),
+            )
+            if result.rowcount:
+                self._decrement_shard_count(shard_name)
 
 
 def _cmd_store(args: argparse.Namespace) -> None:
